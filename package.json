@@ -1,0 +1,23 @@
+{
+  "name": "notion-spending-db",
+  "version": "1.0.0",
+  "main": "index.ts",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "dev": "ts-node-dev --respawn index.ts",
+    "build": "tsc",
+    "start": "node index.ts"
+  },
+  "dependencies": {
+    "@types/express": "^5.0.2",
+    "axios": "^1.9.0",
+    "dayjs": "^1.11.13",
+    "dotenv": "^16.5.0",
+    "telegraf": "^4.16.3"
+  },
+  "devDependencies": {
+    "ts-node": "^10.9.2",
+    "typescript": "^5.8.3"
+  }
+}
