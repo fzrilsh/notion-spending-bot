@@ -7,7 +7,6 @@ import { Telegraf, Scenes, session, Context } from 'telegraf';
 
 dayjs.extend(customParseFormat);
 
-/* ---------------- env ---------------- */
 interface Env {
   TELEGRAM_BOT_TOKEN: string;
   NOTION_TOKEN: string;
@@ -18,7 +17,6 @@ const { TELEGRAM_BOT_TOKEN, NOTION_TOKEN, NOTION_DB_ID } =
 
 if (!TELEGRAM_BOT_TOKEN) throw new Error('BOT token missing');
 
-/* -------------- wizard types ---------- */
 interface WizardState {
   payload: {
     title?: string;
@@ -29,7 +27,6 @@ interface WizardState {
 }
 type BotContext = Context & Scenes.WizardContext<WizardState>;
 
-/* -------------- /add wizard ----------- */
 const addWizard = new Scenes.WizardScene<BotContext>(
   'add-wizard',
   async (ctx) => {
@@ -96,7 +93,6 @@ const addWizard = new Scenes.WizardScene<BotContext>(
   }
 );
 
-/* -------------- bot setup ------------- */
 const bot = new Telegraf<BotContext>(TELEGRAM_BOT_TOKEN);
 const stage = new Scenes.Stage<BotContext>([addWizard]);
 
@@ -109,6 +105,21 @@ bot.start((ctx) =>
   )
 );
 
+bot.help((ctx) =>
+  ctx.reply(
+    `📘 *Panduan Penggunaan Bot*:\n\n` +
+    `• /add — Tambah pengeluaran baru\n` +
+    `• /categories — Lihat daftar kategori\n` +
+    `• /summary — Ringkasan bulan ini\n` +
+    `• /summary DD/MM-DD/MM — Ringkasan rentang tanggal tertentu\n` +
+    `• /help — Tampilkan bantuan\n\n` +
+    `📝 Contoh:\n` +
+    `• /summary 01/05-10/05\n` +
+    `• /add lalu ikuti instruksi pengisian\n`,
+    { parse_mode: 'Markdown' }
+  )
+);
+
 bot.command('add', (ctx) => ctx.scene.enter('add-wizard'));
 
 bot.command('categories', async (ctx) => {
@@ -117,18 +128,61 @@ bot.command('categories', async (ctx) => {
 });
 
 bot.command('summary', async (ctx) => {
-  const { total, perCat } = await monthlySummary();
-  const msg =
-    `📊 Total bulan ini: Rp ${format(total)}\n\n` +
+  const text = ctx.message.text;
+  const args = text.split(' ').slice(1);
+  const detailFlag = args.includes('--detail');
+
+  const rangeArg = args.find((arg) => arg.includes('-') && !arg.startsWith('--'));
+  let start: string | undefined;
+  let end: string | undefined;
+
+  if (rangeArg) {
+    const match = rangeArg.match(/^(\d{2}\/\d{2})-(\d{2}\/\d{2})$/);
+    if (match) {
+      const [_, from, to] = match;
+      const year = dayjs().year(); // gunakan tahun saat ini
+      start = dayjs(from, 'DD/MM').year(year).toISOString();
+      end = dayjs(to, 'DD/MM').year(year).endOf('day').toISOString();
+    } else {
+      await ctx.reply('❌ Format salah. Gunakan `/summary DD/MM-DD/MM` atau tambahkan `--detail`');
+      return;
+    }
+  }
+
+  const { total, perCat, detail } = await monthlySummary(start, end);
+
+  let msg =
+    `📊 Total: Rp ${format(total)}\n\n` +
     Object.entries(perCat)
-      .map(([c, v]) => `${c}: Rp ${format(v)}`)
+      .map(([c, v]) => `• ${c}: Rp ${format(v)}`)
       .join('\n');
-  ctx.reply(msg);
+
+  if (detailFlag && detail.length) {
+    const grouped: Record<string, Parsed[]> = {};
+
+    // Group by category
+    for (const item of detail) {
+      if (!grouped[item.category]) grouped[item.category] = [];
+      grouped[item.category].push(item);
+    }
+
+    msg += `\n\n📄 *Detail per Kategori:*\n`;
+
+    for (const [category, items] of Object.entries(grouped)) {
+      msg += `\n*${category}*:\n`;
+      items
+        .sort((a, b) => dayjs(b.date).unix() - dayjs(a.date).unix())
+        .forEach((item) => {
+          msg += `• ${dayjs(item.date).format('DD/MM HH:mm')} — *${item.title}*: Rp ${format(item.amount)}\n`;
+        });
+    }
+  }
+
+  await ctx.reply(msg, { parse_mode: 'Markdown' });
 });
 
 bot.launch();
 
-/* ------------ helpers --------------- */
 interface Parsed {
   title: string;
   date: string;
@@ -160,12 +214,51 @@ async function getCategories(): Promise<string[]> {
   return data.properties?.Category?.select?.options.map((o: any) => o.name) || [];
 }
 
-async function monthlySummary() {
-  const start = dayjs().startOf('month').toISOString();
+async function monthlySummary(startDate?: string, endDate?: string) {
+  const start = startDate || dayjs().startOf('month').toISOString();
+  const end = endDate || dayjs().endOf('month').toISOString();
+
   const { data } = await axios.post(
     `https://api.notion.com/v1/databases/${NOTION_DB_ID}/query`,
     {
-      filter: { and: [{ property: 'Date', date: { on_or_after: start } }] },
+      filter: {
+        and: [
+          { property: 'Date', date: { on_or_after: start } },
+          { property: 'Date', date: { on_or_before: end } },
+        ],
+      },
+    },
+    notionHeaders()
+  );
+
+  let total = 0;
+  const per: Record<string, number> = [];
+  const detail: Parsed[] = [];
+
+  for (const r of data.results) {
+    const amt = r.properties?.Amount?.number || 0;
+    const cat = r.properties?.Category?.select?.name || 'Other';
+    const title = r.properties?.Title?.title?.[0]?.text?.content || '(untitled)';
+    const date = r.properties?.Date?.date?.start || '';
+
+    total += amt;
+    per[cat] = (per[cat] || 0) + amt;
+    detail.push({ title, date, category: cat, amount: amt });
+  }
+
+  return { total, perCat: per, detail };
+}
+
+async function summaryRange(from: string, to: string) {
+  const { data } = await axios.post(
+    `https://api.notion.com/v1/databases/${NOTION_DB_ID}/query`,
+    {
+      filter: {
+        and: [
+          { property: 'Date', date: { on_or_after: from } },
+          { property: 'Date', date: { on_or_before: to } },
+        ],
+      },
     },
     notionHeaders()
   );
